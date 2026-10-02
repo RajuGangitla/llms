@@ -36,3 +36,83 @@
 - **Dense vs MoE:** same total size → dense smarter; same compute per token → MoE smarter. MoE must still store all experts in memory.
 - **Batching as a general systems idea (LLM vs ClickHouse):** ask 3 questions — (1) what's the expensive fixed cost? (2) is it paid per step, per batch, or per request? (3) how long can the user wait? Per-step cost + impatient users → continuous batching (LLMs). Per-batch cost + tolerant writers → wait-to-fill with timeout (ClickHouse `async_insert`, avoids "Too many parts"). Batching always trades waiting for efficiency.
 - GPUs aren't ideal for single-user decode (memory wall) but win on flexibility + ecosystem; Groq/Cerebras put memory on-chip (fast, expensive).
+
+## Ch 1: Prerequisites
+- Core trade-off: **latency vs throughput vs quality** — optimize for your use case, not one number (NFL player analogy).
+- **Shared (API, pay per token)** first. Switch to **dedicated (own GPUs)** for: **Scale** (per-GPU-hour cheaper than per-token), **Specialization** (fine-tuned/custom model, strict latency/uptime), **Orchestration** (multi-model pipelines).
+  - Rough math: $2/hr GPU ≈ $1,440/mo ≈ 2.9B tokens at $0.50/M. One GPU at 1,000 tok/s 24/7 ≈ 2.6B tokens/mo → self-hosting only wins with lots of steady traffic.
+- **Online** (chat, voice, code completion) → optimize latency. **Offline** (batch transcription, doc processing) → optimize throughput, big batches. Same model can have two deployments.
+- **Consumer** → cost + flexibility. **B2B** → latency + uptime. Compliance (data region, privacy) limits infra choices.
+- **Model selection is the biggest optimization:** smallest model that passes YOUR evals. Public benchmarks get gamed (Goodhart's law). Fine-tuning = adapt weights to a domain (text-to-SQL: few-B model can match huge ones). Distillation = small student copies big teacher's probability outputs.
+- **Metrics:** TTFT (prefill, compute-bound), TPS (decode, bandwidth-bound), ITL (10 ms ITL = 100 tok/s). "TPS" is ambiguous: per-user (latency) vs total (throughput) — my lab showed both.
+- Use **percentiles** (P50/P90/P99), not averages — latency is right-skewed. Measure **end-to-end** (incl. queue + network), not just GPU time. Fast GPU time + slow end-to-end → fix infrastructure, not the model.
+- TTFT fixes: long prompt → prefix caching / shorter prompt; queueing → capacity/batching. Weight-only quantization barely helps prefill (compute-bound).
+
+## Ch 2: Models
+- Two model styles: **autoregressive** (LLMs, one token per pass → memory-bound decode) vs **iterative denoising** (diffusion images/video, whole image per step, fixed steps → compute-bound; speed-up = fewer steps).
+
+### 2.1 Neural networks
+- Neuron → layer (neurons side by side, same input) → network (layers chained). Input / hidden / output layers. Hidden state = token's vector between layers; dimensionality = its size (text goes UP: 1 id → 4096 numbers; images go DOWN).
+- **Encoder** = network that understands input (embedding models, BERT). **Decoder** = network that generates (LLMs). Whisper = encoder+decoder. Modern LLMs are decoder-only: ONE network does both prefill and decode. (DeepSeek V4.1 Flash, Sep 2026: causal encoder-decoder — 8B active input / 16B active output.)
+- **Linear layer = matmul:** `y = xW + b`. W = grid of weights (one column per neuron). Compute per token ≈ **2 × parameters** (multiply + add per weight).
+- **Shape of x decides the bottleneck:** decode 1 user = x is 1 row → each weight read used once → memory-bound. Prefill / batching = many rows → each weight read reused many times → compute-bound. Reuse ratio = **arithmetic intensity** (2.4.1).
+- **Activation functions:** stacked linear layers collapse into one (x·2·3 = x·6). Non-linear ReLU/SiLU/SwiGLU between layers prevents collapse → depth means something. Cheap vs matmul.
+
+### 2.2 LLM inference mechanics
+- Loop: chat template + tokenize → **prefill** (process input, BUILD KV cache) → **decode** repeat: forward pass → logits (1 score per vocab token, 100K+) → softmax → sampling → stop token or max_tokens.
+- 3 sequences share the context window: input, reasoning (thinking), output. Wrong chat template = dumber model even with perfect weights.
+- **Thinking tokens are decode tokens** (generated one by one). 1,000 thinking tokens at 69 tok/s ≈ 15 s before the real answer → TTFT lies for reasoning models; measure time to first answer token. Reasoning = expensive (slow phase + bigger KV cache).
+- **Temperature** divides the logits (scores, not token IDs) before softmax: low → top token dominates, high → flatter/random, 0 → always top. Top-k = keep k best; top-p = smallest set summing to p. Structured output = block invalid tokens (logit biasing). Sampling is cheap, but high temperature lowers speculative-decoding acceptance.
+
+### 2.2.1 Architecture (config.json)
+- `config.json` = model shape (layers, hidden size, heads, vocab, context). `ollama show qwen3:4b`: arch qwen3, 4.0B params, context 262144, hidden 2560, Q4_K_M, temp 0.6 / top_k 20 / top_p 0.95, stop `<|im_end|>`.
+- Name `Qwen3MoeForCausalLM` = family + version + MoE + causal LM (predicts next token looking backward; vs masked LM like BERT).
+- Sizes, base/instruct, LoRA fine-tunes share one architecture → engine optimizations transfer for free. LoRA changes weights, not architecture.
+- Config context length = what the model CAN handle, not what VRAM can HOLD.
+
+### 2.2.2 Transformer blocks
+- Embedding layer → transformer blocks ×N (attention + MLP + norm) → LM head (output layer) → logits.
+- **MLP = most weights (~⅔)** → main quantization target. **Attention = most complexity** (KV cache). Norm/activations = rounding error.
+- LM head = hidden × vocab matmul (2560 × ~152K ≈ 390M weights ≈ 10% of 4B), read every decode step. Embedding is a cheap lookup.
+
+### 2.2.3 Attention + KV cache
+- LLMs use **self-attention** (Q,K,V from same sequence, causal mask). Cross-attention = Q from one input, K/V from another (image gen, Whisper decoder).
+- Q, K, V = token vector × learned W_Q, W_K, W_V — for every token, at every layer.
+- **Without KV cache:** recompute K,V of all past tokens every step → quadratic. **With KV cache:** compute K,V once per token, store, reuse → linear.
+- Only **K and V** cached: Q is only needed for the newest token, once. K/V are read by every future token.
+- Cache layout: [layer] × [K/V] × [KV head] × [position] × [head dim]. qwen3:4b ≈ 2 × 36 × 8 × 128 × 2 bytes ≈ **144 KB per token per user** → 4K tokens ≈ 590 MB, 262K ≈ 37 GB.
+- Prefill builds the cache; decode reads it + appends 1 entry per step. Grows per token AND per user → VRAM limit.
+
+### 2.2.4 MoE
+- Qwen3-235B-A22B: 235B total, 22B active; 128 experts/layer, router picks 8 per layer per token.
+- 1 user → reads only active experts → fast. **Batching kills much of the advantage:** different users pick different experts → nearly all experts read each step. Fix = expert parallelism (spread experts across GPUs, ch 5).
+- Strata-style offload (hot experts on GPU, rest in RAM) works for 1 user, breaks with many users (rare experts needed constantly).
+- Dense usually better under ~32B; MoE pays off at 100B+.
+
+(2.3 image generation — skipped, not my goal.)
+
+### 2.4 Calculating bottlenecks (diagnosis)
+- GPU has 2 speeds: **compute** (ops/s) and **memory bandwidth** (bytes/s). Find which one limits you; optimizing the other does nothing.
+- Prefill → compute-bound. Decode → memory-bound. Image/video gen → compute-bound. Batching makes decode less memory-bound (more math per byte moved).
+- **ops:byte ratio** (GPU) = compute ÷ bandwidth. H100 FP16: 989 TFLOPS ÷ 3.35 TB/s ≈ **295**. **Arithmetic intensity** (work) = ops ÷ bytes moved. Intensity < ratio → memory-bound; > ratio → compute-bound. Roofline chart = slope (memory limit) then flat roof (compute limit).
+- Decode weights FP16: 2 ops per weight ÷ 2 bytes ≈ 1 op/byte per user → batch ~295 users on H100 before compute-bound. Book's standard-attention example (N=4096, d=128) ≈ 62 ops/byte < 295 → memory-bound. Exact calc is academic; the intuition matters.
+
+### 2.5 Optimizing attention (treatment)
+- Problem: N×N score grid (4096² ≈ 32 MB), quadratic. Naive attention writes S and P to VRAM and reads them back.
+- **Implementation fixes (lossless, runtime = my job):** **FlashAttention** — tiles fit in fast SRAM, fused score→softmax→×V, never writes the big grid; GPU-specific kernels. **PagedAttention** — KV cache in pages via lookup table → less fragmentation, more users.
+- **Algorithm fixes (baked in training):** sliding window (Muse Glimmer), gated (Muse Glimmer), linear (Qwen 3.8 Gated DeltaNet), compressed (DeepSeek V4), MLA (DeepSeek/Kimi/GLM), Mamba/state-space hybrids (Nemotron). Intuition: nearby tokens matter more.
+
+### End-of-chapter-2 LAB checklist
+- [ ] Install torch + transformers (CUDA), model Qwen3-0.6B
+- [ ] Print config (layers, hidden, heads, KV heads)
+- [ ] Chat template + token IDs
+- [ ] Prefill: hidden-state shape at every layer, time, KV cache size
+- [ ] Decode: shape per step, KV cache growing, ms per token
+- [ ] Sampling: top-5 probs under different temperature / top-k / top-p
+- [ ] Memory moving: weight bytes per step ÷ step time = real bandwidth vs 256 GB/s
+- [ ] Build my own KV cache in attention.py (Q used once, K/V appended)
+
+### Memory-bound vs compute-bound
+- Each step = **moving time** (weights VRAM → cores, limited by memory bandwidth) + **math time** (limited by compute). Longer one = bottleneck.
+- Memory-bound = cores waiting for weights. Compute-bound = cores busy doing math. Same weights moved either way; only the amount of math per weight changes.
+- **Decode speed ≈ memory bandwidth ÷ model size.** Check: RTX 4060 laptop ~256 GB/s ÷ 2.5 GB (qwen3:4b Q4) ≈ 100 tok/s ceiling; measured 69 tok/s → single-user decode is memory-bound.
