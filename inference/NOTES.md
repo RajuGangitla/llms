@@ -110,7 +110,7 @@
 - [x] Decode: shape per step, KV cache growing, ms per token
 - [x] Sampling: top-5 probs under different temperature / top-k / top-p
 - [x] Memory moving: weight bytes per step ÷ step time = real bandwidth vs 256 GB/s
-- [ ] Build my own KV cache in attention.py (Q used once, K/V appended)
+- [x] Build my own KV cache (inference/kv_cache.py, Qwen3.8-27B sizes)
 
 ### Memory-bound vs compute-bound
 - Each step = **moving time** (weights VRAM → cores, limited by memory bandwidth) + **math time** (limited by compute). Longer one = bottleneck.
@@ -126,3 +126,11 @@
 - Timing varies run to run (46.8 ms vs 26 ms prefill) → benchmark many runs, report P50/P99.
 - Bandwidth: 1.19 GB ÷ 14.9 ms = **80 GB/s, only 31% of 256**. Expected 4.6 ms; the other ~10 ms is **launch overhead**: ~400 small kernels per token launched one by one from Python, with the GPU idle in between.
 - Proof: Ollama (llama.cpp, C++) runs qwen3:4b (2.5 GB) at the same 69 tok/s ≈ 170 GB/s. Same GPU, same speed, 4x the model → the gap is software. Fixes: CUDA graphs, kernel fusion, no Python in the hot loop.
+
+### My own KV cache (kv_cache.py, Qwen3.8-27B attention sizes, 1 head, GPU)
+- Token 5120 → W_q (5120×6144) → Q = 24 heads × 256; W_k/W_v (5120×1024) → K, V = 4 heads × 256. Matmul rule: (a,b)@(b,c) → (a,c); output size = W's columns.
+- GQA: 24 Q heads ÷ 4 KV heads = 6 Q heads read the same KV head, all at the same time (reading isn't exclusive). Fewer KV heads → smaller cache AND fewer bytes read per decode step.
+- 2000 decode steps: no cache 7.2 s (5.1 ms/step and rising, N²) vs cache 1.6 s (0.8 ms/step, N). Same answer (allclose True). Q is never cached.
+- The cache still slows a little: attention reads all cached K/V, and torch.cat copies the whole cache every step → PagedAttention uses fixed pages instead.
+- Cache match: within a request by POSITION (row i = position i; same token ID at a different position has different K, because of context + RoPE). Across requests (prefix caching) by the exact token-ID sequence from the start, hashed in blocks of 16 with the parent hash.
+- Size check: 2000 tokens × 1024 K numbers × 2 bytes (bf16) × 2 (K+V) × 16 full-attention blocks = 131 MB = 64 KB/token ✓.
