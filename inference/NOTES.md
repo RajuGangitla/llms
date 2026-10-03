@@ -103,16 +103,26 @@
 - **Algorithm fixes (baked in training):** sliding window (Muse Glimmer), gated (Muse Glimmer), linear (Qwen 3.8 Gated DeltaNet), compressed (DeepSeek V4), MLA (DeepSeek/Kimi/GLM), Mamba/state-space hybrids (Nemotron). Intuition: nearby tokens matter more.
 
 ### End-of-chapter-2 LAB checklist
-- [ ] Install torch + transformers (CUDA), model Qwen3-0.6B
-- [ ] Print config (layers, hidden, heads, KV heads)
-- [ ] Chat template + token IDs
-- [ ] Prefill: hidden-state shape at every layer, time, KV cache size
-- [ ] Decode: shape per step, KV cache growing, ms per token
-- [ ] Sampling: top-5 probs under different temperature / top-k / top-p
-- [ ] Memory moving: weight bytes per step ÷ step time = real bandwidth vs 256 GB/s
+- [x] Install torch + transformers (CUDA), model Qwen3-0.6B
+- [x] Print config (layers, hidden, heads, KV heads)
+- [x] Chat template + token IDs
+- [x] Prefill: hidden-state shape at every layer, time, KV cache size
+- [x] Decode: shape per step, KV cache growing, ms per token
+- [x] Sampling: top-5 probs under different temperature / top-k / top-p
+- [x] Memory moving: weight bytes per step ÷ step time = real bandwidth vs 256 GB/s
 - [ ] Build my own KV cache in attention.py (Q used once, K/V appended)
 
 ### Memory-bound vs compute-bound
 - Each step = **moving time** (weights VRAM → cores, limited by memory bandwidth) + **math time** (limited by compute). Longer one = bottleneck.
 - Memory-bound = cores waiting for weights. Compute-bound = cores busy doing math. Same weights moved either way; only the amount of math per weight changes.
 - **Decode speed ≈ memory bandwidth ÷ model size.** Check: RTX 4060 laptop ~256 GB/s ÷ 2.5 GB (qwen3:4b Q4) ≈ 100 tok/s ceiling; measured 69 tok/s → single-user decode is memory-bound.
+
+### Chapter 2 LAB results (my_lab.py, Qwen3-0.6B bf16, RTX 4060 laptop)
+- Config: 0.6B params, 1.19 GB, 28 layers, hidden 1024, 16 Q heads / 8 KV heads (GQA 2:1), head_dim 128, vocab 151,936. KV = 112 KB/token → 40K tokens ≈ 4.5 GB, ~4x the weights.
+- Tokens: 7-word prompt became 20 tokens; the chat template adds ~11 tokens every turn. Special tokens have the highest IDs (added after BPE). Space is part of the token (' why' ≠ 'why').
+- Model = embedding (lookup table) → 28 blocks (attention + MLP) → LM head. Shape stays (1, N, 1024) through all blocks; the LM head makes (1, N, 151936).
+- Prefill: (1, 21, 1024) in ~26 ms. Decode: (1, 1, 1024) in ~14.6 ms. **One token costs about as much as 21**, because both read all the weights → decode is memory/overhead-bound.
+- Sampling: confident prompt → T barely matters ("The" 99.7% even at T=1.5). Open prompt → T=1.5 spreads it out (top-5 only 51%, the rest is junk in the tail → top-k/top-p cut it). T=0.1 showed IDs 0–3 at 0.0%: underflow ties, not real choices → engines use argmax for T=0.
+- Timing varies run to run (46.8 ms vs 26 ms prefill) → benchmark many runs, report P50/P99.
+- Bandwidth: 1.19 GB ÷ 14.9 ms = **80 GB/s, only 31% of 256**. Expected 4.6 ms; the other ~10 ms is **launch overhead**: ~400 small kernels per token launched one by one from Python, with the GPU idle in between.
+- Proof: Ollama (llama.cpp, C++) runs qwen3:4b (2.5 GB) at the same 69 tok/s ≈ 170 GB/s. Same GPU, same speed, 4x the model → the gap is software. Fixes: CUDA graphs, kernel fusion, no Python in the hot loop.
