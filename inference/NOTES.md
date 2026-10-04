@@ -134,3 +134,25 @@
 - The cache still slows a little: attention reads all cached K/V, and torch.cat copies the whole cache every step → PagedAttention uses fixed pages instead.
 - Cache match: within a request by POSITION (row i = position i; same token ID at a different position has different K, because of context + RoPE). Across requests (prefix caching) by the exact token-ID sequence from the start, hashed in blocks of 16 with the parent hash.
 - Size check: 2000 tokens × 1024 K numbers × 2 bytes (bf16) × 2 (K+V) × 16 full-attention blocks = 131 MB = 64 KB/token ✓.
+
+### Reading: How Transformers Work — Attention Explained (prompt20 blog)
+https://blog.prompt20.com/posts/how-transformers-work-attention-explained/
+Best single article on the full transformer block. Re-read for the parts I haven't built yet.
+- **Block** = norm → attention → **add back** → norm → feed-forward → **add back**.
+- **Residual stream**: one vector per token flows through every block; each block *adds* to it ("a shared notepad"), it doesn't replace it.
+- **Feed-forward (MLP)**: expand → nonlinearity → shrink, per token, no mixing between tokens. Holds most of the parameters.
+- **Multi-head**: heads split a fixed budget; outputs concatenated → **W_O** → back to hidden size.
+- **Position**: sinusoidal (2017) → learned → **RoPE** (modern; rotates Q and K so attention depends on the distance i−j).
+- **Cost**: attention is quadratic in length; the KV cache grows linearly and can exceed the weights on long chats.
+- **Misconceptions**: attention is a soft blend (not a hard pick); heads often multitask; long context ≠ evenly used context.
+- **Gaps still to build**: W_O, residual + RMSNorm, the MLP at real size (5120 → 17408 → 5120).
+- **Questions to answer from memory**:
+  1. Delete block 15 of a trained model — garbage, or slightly worse? Why (residual)?
+  2. Qwen3.8-27B: attention weights ≈ 5120×(6144+1024+1024+6144) vs MLP ≈ 3×5120×17408 — which is bigger? What does that mean for quantization and decode speed?
+  3. Qwen3-0.6B: hidden 1024 but Q = 16×128 = 2048 — does that break "heads split a fixed budget"? What does it cost?
+  4. A 262K-context model that mostly ignores the middle — what are you paying for in the KV cache?
+- **Section 1 — why RNNs hit a wall** (done):
+  - RNN = one fixed-size notebook rewritten each word → forgets; sequential → slow training; word 1→50 = 49 hops (vanishing gradient).
+  - Attention fixes each one, and each fix has a "but": keeps every token's K,V (→ KV cache grows); parallel in training + prefill (→ decode is still sequential, one token per pass); 1 hop between any two words.
+  - Trade-off: 100 users × 100K ctx, pure attention 27B-size = 25.6 GB KV/user = 2.5 TB total; linear/RNN-style state ≈ 150 MB/user fixed. → Hybrid models (Qwen3.8: 16 attention + 48 linear layers) keep exact recall and cut memory ~4×.
+  - Lesson: never answer "of course X" — do the math for the workload.
