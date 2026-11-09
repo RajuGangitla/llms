@@ -156,3 +156,15 @@ Best single article on the full transformer block. Re-read for the parts I haven
   - Attention fixes each one, and each fix has a "but": keeps every token's K,V (→ KV cache grows); parallel in training + prefill (→ decode is still sequential, one token per pass); 1 hop between any two words.
   - Trade-off: 100 users × 100K ctx, pure attention 27B-size = 25.6 GB KV/user = 2.5 TB total; linear/RNN-style state ≈ 150 MB/user fixed. → Hybrid models (Qwen3.8: 16 attention + 48 linear layers) keep exact recall and cut memory ~4×.
   - Lesson: never answer "of course X" — do the math for the workload.
+
+## Ch 3: Hardware
+- Modes: cloud, on-premise (my team: prod 2× 5090, machine 191 Qualcomm), air-gapped.
+
+### 3.1 GPU architecture
+- GPU = throughput machine: one simple op on thousands of numbers at once. GPU → many **SMs** (workshops); each SM has 4 **Tensor Cores** (matmul, MMA: D = A×B + C), 128 CUDA cores (single numbers: adds, norms), SFUs (exp/sin/log for softmax), and its own L1 cache. RTX 4060 laptop: 24 SMs / 96 Tensor Cores. RTX 5090: 170 / 680. A *tensor* is data; a *Tensor Core* is hardware.
+- FLOPS: compare **dense**, at the **same precision**. Compute limits prefill and image/video.
+- Memory: **SRAM** on-chip caches (L0, L1 per SM, L2 shared; KB–MB, fast) vs **VRAM** = DRAM off-chip (GB, slower). VRAM bandwidth limits decode at low/medium batch.
+- Sizing rule: VRAM ≥ weights + at least 50% headroom for KV cache, or OOM.
+- **My tests (ch3_cpu_vs_gpu.py, ch3_memory.py):** 4096² matmul: CPU 1 thread 1243 ms, CPU all threads 231 ms, GPU FP32 16 ms (8.6 TFLOPS), GPU FP16 5 ms (~27 TFLOPS; 3.2×, book says ~2×). All threads only 5.4× (10 real cores, 4 small, shared power and memory).
+- Read speed: 8–16 MB blocks 712–943 GB/s (cache) vs 64 MB+ 153–173 GB/s (VRAM; ~230 in an earlier run, rated ~256). Cache is 5–6× faster; the cliff is between 16 and 64 MB.
+- Correction: my lab decode split (4.6 ms memory + 10 ms overhead) assumed the rated 256 GB/s. With measured speed it's more like 5–8 ms memory + 7–10 ms overhead.
