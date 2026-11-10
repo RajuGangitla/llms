@@ -168,3 +168,31 @@ Best single article on the full transformer block. Re-read for the parts I haven
 - **My tests (ch3_cpu_vs_gpu.py, ch3_memory.py):** 4096² matmul: CPU 1 thread 1243 ms, CPU all threads 231 ms, GPU FP32 16 ms (8.6 TFLOPS), GPU FP16 5 ms (~27 TFLOPS; 3.2×, book says ~2×). All threads only 5.4× (10 real cores, 4 small, shared power and memory).
 - Read speed: 8–16 MB blocks 712–943 GB/s (cache) vs 64 MB+ 153–173 GB/s (VRAM; ~230 in an earlier run, rated ~256). Cache is 5–6× faster; the cliff is between 16 and 64 MB.
 - Correction: my lab decode split (4.6 ms memory + 10 ms overhead) assumed the rated 256 GB/s. With measured speed it's more like 5–8 ms memory + 7–10 ms overhead.
+
+### 3.2 GPU generations
+- Name = letter (generation) + number (model; bigger = bigger GPU). H100 → H200 same gen; B200 next gen. New generation every 1–2 years.
+- Each generation adds: smaller formats, faster memory, better links. **Hopper** (H100 80 GB 3.35 TB/s, H200 141 GB 4.8 TB/s): FP8 (2× FP16), FlashAttention 3. **Ada** (L4 24 GB 300 GB/s, L40 48 GB 864 GB/s): FP8, graphics-focused, **no NVLink** → only cheap small models. **Blackwell** (B200 192 GB, B300 288 GB, up to 8 TB/s, ~5 PFLOPS FP8): **FP4** + MXFP8/MXFP4/NVFP4, FlashAttention 4 = new gold standard. **Rubin** (2026): **HBM4** helps decode + **CPX** chip for prefill = disaggregation in hardware. Feynman 2028.
+- Grace/Vera CPUs: NVLink chip-to-chip up to 900 GB/s CPU↔GPU (several × PCIe) → fast KV/LoRA offload to RAM.
+- New generations take ~1 year for software to catch up → benchmark before trusting specs.
+- My machines: laptop RTX 4060 + llm.remote RTX 5000 = Ada; prod 2× RTX 5090 = Blackwell (consumer, no NVLink → PCIe only).
+- Prices (Nov 2026, estimates): B200 ~$30–50K to buy, ~$3.50–8.60/GPU-hour to rent; B300 ~$50–60K, ~$7–18/hr. One B200 ≈ 15–25 RTX 5090s. DGX = NVIDIA's full 8-GPU server (HGX = just the board, others build the server). DGX B200 ≈ 1.5 TB GPU memory → weights up to ~1 TB with KV headroom. Kimi-K3.1-Pro (1,561 GB, 4-bit) doesn't fit one; GLM-5.3 (756 GB) and DeepSeek-V4.1-Flash (510 GB) do.
+
+### 3.3 Instances
+- Instance = GPUs + CPUs + RAM + storage + network + interconnect. Any can be the bottleneck. Same GPU can differ (A100 SXM vs PCIe).
+- Node = 8 GPUs. Inside: NVLink (1,800 GB/s Blackwell, 900 Hopper) + NVSwitch (all-to-all). Between nodes: InfiniBand up to 400 Gb/s = 50 GB/s (Gb ≠ GB; ~36× slower than NVLink). NVL72 = 72 Blackwell GPUs in one NVLink rack. Keep heavy syncing inside a node.
+- PCIe 5.0 ×16 ≈ 64 GB/s (prod 5090s); Qualcomm cards also PCIe → why multi-chip sync is costly on my machines.
+- **MIG**: built-in hardware feature on A100/H100/H200/B200 (not 4060/5090/RTX 5000). Splits one GPU into up to 7 slices, each with its own SMs, VRAM, L2 and bandwidth → no interference. H100 132 SMs → 7 compute slices, 8 memory slices. Fixed profiles (1g.10gb, 3g.40gb...), admin command `nvidia-smi mig`. Good for small models (3B TTS). vs llm.remote: 5 processes share one GPU without MIG → they compete.
+
+### 3.4 Other accelerators
+- AMD MI350, Google TPU, AWS Inferentia/Trainium, Groq LPU (SRAM-only), Cerebras WSE-3 (wafer-scale), Qualcomm Cloud AI 100 Ultra, Etched Sohu (transformer ASIC), Furiosa RNGD, SambaNova RDU.
+- Bets: memory bandwidth (Groq, Cerebras), power efficiency (Qualcomm, Furiosa), cloud integration (Google, AWS). Shared problems: software (no CUDA = rebuild the stack), manufacturing, distribution. CUDA = NVIDIA's moat.
+- SRAM-only (Groq) removes the memory road but needs ~600 chips for a 70B model. Qualcomm = middle: more SRAM than GPUs, cheap slow LPDDR (~550 GB/s per Ultra card, from memory), ~150 W. My estimate: Qwen3.8-27B at 50 TPS for one user needs ~4 cards (range 3–8), limited by chip-to-chip sync; 5090 does ~110 TPS ceiling alone.
+
+### 3.5 Local inference
+- Pros: no network latency, offline, privacy, free for the developer. Cons: weak hardware, thermals, fragmented devices, battery.
+- Desktop: RTX 5090 32 GB 1,792 GB/s ~$5K vs Apple M3 Ultra 512 GB 819 GB/s ~$10K (capacity vs speed). MoE helps local (few active weights). Ollama/llama.cpp run quantized 100B+ models.
+- Mobile: >1–2B params is hard; good for speech, transcription, translation. Future = local + cloud together.
+
+### Kernels (side discussion)
+- Kernel = one function launched on thousands of GPU threads. One decode step ≈ 400 kernels → launch gaps (my 80 GB/s). Fixes: fused kernels → CUDA Graphs → megakernel (whole forward pass in one kernel, overlaps weight loading; near bandwidth limit; very hard).
+- Plan: finish the book first, then CUDA basics → Triton → fused kernels → CUDA Graphs on my_lab decode → megakernels.
