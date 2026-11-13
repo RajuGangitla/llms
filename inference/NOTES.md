@@ -196,3 +196,55 @@ Best single article on the full transformer block. Re-read for the parts I haven
 ### Kernels (side discussion)
 - Kernel = one function launched on thousands of GPU threads. One decode step ≈ 400 kernels → launch gaps (my 80 GB/s). Fixes: fused kernels → CUDA Graphs → megakernel (whole forward pass in one kernel, overlaps weight loading; near bandwidth limit; very hard).
 - Plan: finish the book first, then CUDA basics → Triton → fused kernels → CUDA Graphs on my_lab decode → megakernels.
+
+## Ch 4: Software
+Ladder (closest to GPU → farthest): CUDA kernels → PyTorch → inference engines → Dynamo.
+Hardware changes every 1–2 years, software every week → most inference work is at the engine level.
+
+### 4.1 CUDA
+- CUDA = how you write code for NVIDIA GPUs (C++ compiled by nvcc). Parts: kernel, CUDA Graph, driver, runtime.
+- Kernel = a function run by thousands of threads at once (each thread finds its own index i).
+- Fast kernel = fewer trips to VRAM (cook analogy: VRAM = supermarket, SRAM = counter, Tensor Cores = hands).
+- 4.1.1 Don't start from zero: BLAS → cuBLAS (GEMM = every linear layer), cuDNN, FlashInfer (paged attention,
+  fused sampling), CUTLASS/CuTe (building blocks for custom kernels; FlashAttention 3 uses CUTLASS).
+- Prefill GEMM ≈ 1,170 FLOPs/byte (compute-bound); decode batch-1 GEMM ≈ 1 FLOP/byte (memory-bound). 4060 ridge ≈ 100.
+- 4.1.2 Kernel selection: kernels are tied to one GPU (SRAM size, Tensor Cores hard-coded). Usually automatic;
+  sometimes swap by hand (DeepGEMM for FP8 on Hopper).
+- 4.1.3 Fusion: merge kernels → skip the write+read round trip (×2 then ×3 = ×6). Matters most in decode.
+  FlashAttention = scores+softmax+×V in one kernel, scores matrix never hits VRAM.
+- Custom kernels are written for: new GPUs, new math (MLA → FlashMLA), fusion. Workflow: profile → replace slowest → re-measure.
+
+### 4.2 Frameworks
+- PyTorch won (TensorFlow faded, JAX = sharp edges). torch.compile = auto kernel selection + fusion,
+  but can't fuse plugin kernels (FlashAttention, DeepGEMM).
+- safetensors: weights only, no code (safe, unlike pickle .bin), mmap loading, split into many files.
+  ONNX: weights + graph (portable). GGUF (llama.cpp/Ollama): weights + config + tokenizer, often quantized.
+- ONNX Runtime (any hardware) vs TensorRT (NVIDIA only, compiled engine per GPU type, fastest).
+  Export breaks on new ops (MLA). For LLMs the trend is safetensors → engine directly.
+- transformers/diffusers = reference code + config.json + downloads. Not production.
+
+### 4.3 Inference engines
+| | vLLM | SGLang | TensorRT-LLM |
+|---|---|---|---|
+| speed | good | good | best (NVIDIA kernels, some closed) |
+| ease | easy | easy | hard (Docker + config.yaml) |
+| strength | widest model + hardware support, day zero | big MoE multi-node, close to DeepSeek/Qwen/Kimi | Hopper/Blackwell, NVFP4 |
+- All have continuous batching, prefix caching, quantization, speculation, parallelism, disaggregation.
+- Principle: more constraints → more performance.
+- TRT-LLM V0 = TensorRT plugin; V1 (2025) = PyTorch-based. Check the version.
+
+### 4.4 Dynamo
+- Manager above engines: KV-aware routing, disaggregation (prefill/decode workers), multi-node parallelism,
+  SLA planner auto-scaling. Only worth it at big scale (not for 1–2 GPU boxes).
+
+### 4.5 Benchmarking
+- Best = shadow production traffic. Else match ISL/OSL, traffic pattern (jitter), real prompts, real params.
+- Tools: genai-bench, GenAI-Perf, Locust, `vllm bench serve`. Report p50/p90 TTFT, TPOT, throughput.
+- Eval datasets (MMLU, gsm8k, HumanEval) = realistic prompts + quality check after optimizing.
+- Baseline first, change one thing at a time, repeat runs. Optimizations can fight (speculation + big batch).
+- Profiling = why: PyTorch Profiler → Nsight Systems (whole system) → Nsight Compute (inside one kernel).
+
+### Machines found (Ch4 side)
+- 191: Ollama on CPU — Qwen2.5-7B Q4_K_M (4.7 GB), Qwen2.5-3B Q4_K_M, ~ALLaM-7B Q8_0; cohere ASR on QAIC cards.
+- 122: k8s/ClickHouse/MSSQL node, no accelerators, no LLMs.
+- Rent plan (Nov 2026, RunPod community): 5090 $0.69, H100 PCIe $1.99, H100 SXM $2.69, B200 $5.98 → ~$150–200 total.
