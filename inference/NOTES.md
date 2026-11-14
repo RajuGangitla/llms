@@ -248,3 +248,31 @@ Hardware changes every 1–2 years, software every week → most inference work 
 - 191: Ollama on CPU — Qwen2.5-7B Q4_K_M (4.7 GB), Qwen2.5-3B Q4_K_M, ~ALLaM-7B Q8_0; cohere ASR on QAIC cards.
 - 122: k8s/ClickHouse/MSSQL node, no accelerators, no LLMs.
 - Rent plan (Nov 2026, RunPod community): 5090 $0.69, H100 PCIe $1.99, H100 SXM $2.69, B200 $5.98 → ~$150–200 total.
+
+## Ch 5: Techniques
+### 5.1 Quantization — theory so far
+- Fewer bits → prefill faster (if math runs in low precision: FP8 W8A8) and decode faster (fewer bytes). ~30–50% per step down.
+- Weight-only (Q4, AWQ, GPTQ) → decode faster only. Weights + activations (FP8) → both.
+- 8 bits = 256 patterns (−128..127), 4 bits = 16, 2 bits = 4.
+- Float = sign + exponent (range) + mantissa (precision), like scientific notation in base 2.
+  FP16 1-5-10 max 65,504; BF16 1-8-7 (FP32 range, Google); FP8 E4M3 1-4-3 max 448 (1.75 × 2^8); E5M2 more range.
+- Hardware: memory/decode wins work anywhere with an unpack kernel; math wins need a circuit (FP4 only on Blackwell).
+- Symmetric quant = coins: coin = max|w| ÷ 127, store round(w ÷ coin), read back = stored × coin.
+  Asymmetric = shift the ruler (+ zero point) for one-sided data. Clipping = cap outliers.
+- Granularity: per-tensor (one coin for millions) vs block 32 (one coin per 32) → outliers only hurt their block.
+- MXFP4/MXFP8 = block 32; NVFP4 = block 16 + FP32 global scale. Production → FP8. Local → GGUF dynamic.
+
+### 5.1 LAB: ch5_quantize.py (Qwen3-0.6B, RTN fake-quant of all 196 linears, 440M numbers)
+One matrix: typical |w| 0.0209, biggest 0.5547 → outlier 26× typical.
+| setting | size MB | zeros % | perplexity | answer |
+|---|---|---|---|---|
+| BF16 | 881 | 0 | 13.32 | red, blue, yellow ✅ |
+| FP8 per-tensor | 440 | 0 | 13.67 (+2.6%) | ✅ |
+| INT8 per-tensor | 440 | 5.7 | 13.71 (+2.9%) | ✅ |
+| INT4 per-tensor | 220 | 72.8 | 64,347,636 💥 | garbage |
+| INT4 block 32 | 248 | 14.1 | 18.36 (+38%) | ✅ but dumber |
+| INT3 block 32 | 193 | 31.8 | 49.20 | loops "the three of the three" |
+| INT2 block 32 | 138 | 75.9 | 38,545,576 💥 | garbage |
+Lessons: granularity > bits (INT3 block works, INT4 per-tensor dies); outliers crush small weights
+(coin 0.079 vs typical 0.021 → 0); scales cost memory (248 vs 220 MB); FP8 beats INT8 at the same size.
+Would not ship INT4 RTN (+38%) → use FP8, or AWQ/GPTQ + evals (5.1.2, 5.1.3).
