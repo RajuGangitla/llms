@@ -276,3 +276,38 @@ One matrix: typical |w| 0.0209, biggest 0.5547 → outlier 26× typical.
 Lessons: granularity > bits (INT3 block works, INT4 per-tensor dies); outliers crush small weights
 (coin 0.079 vs typical 0.021 → 0); scales cost memory (248 vs 220 MB); FP8 beats INT8 at the same size.
 Would not ship INT4 RTN (+38%) → use FP8, or AWQ/GPTQ + evals (5.1.2, 5.1.3).
+
+### 5.1 my own quantizer (my_quant.py, my_quant_real.py)
+- 6 numbers: INT8 scale 0.085, errors ≤ 0.04; INT4 scale 1.54 → 0.25 became 0; outlier 100 → INT8 as bad as INT4;
+  2 blocks of 3 → the block without the outlier got scale 0.024 and error ~0.
+- Real Qwen down_proj (block 27, 1024×3072 = 3.1M): mean |w| 0.0209, absmax 0.5547 (26×).
+  INT8 per-tensor 7.1% zeros err 0.00109 | INT4 per-tensor 86.5% zeros err 0.01738 | INT4 block 32 14.8% err 0.00227.
+- Block sweep INT4 err (real bits): 8 0.00151 (6.0) | 16 0.00191 (5.0) | 32 0.00227 (4.5) | 64 0.00260 (4.25)
+  | 128 0.00291 (4.125) | 1024 0.00382 (4.016) | per-tensor 0.01738 (4.0). Smooth until 1024, then a jump → why MX=32, NVFP4=16.
+- 5.1.2: I can only do PTQ (QAT = labs: GPT-OSS MXFP4, Kimi K2 INT4). ModelOpt / llm-compressor.
+  Sensitivity: weights < activations < KV cache (compounds over tokens) < attention/softmax. Keep first/last layers.
+- 5.1.3: perplexity + benchmarks (MMLU, gsm8k) + custom evals; loss must be noise-level. Quantization is a scale.
+
+### 5.2 Speculative decoding
+- Speculator drafts N tokens, target verifies in ONE pass → N+1 tokens per pass. Lossless, TPS only (not TTFT).
+- Factors: draft cost, draft length, acceptance rate. Bad at high temperature and big batches (turn off).
+- Draft-target (≥10× smaller, same tokenizer) → Medusa (extra heads) → EAGLE-3 (reads 3 hidden states, ≤8 drafts)
+  → n-gram/SuffixDecoding (copy from input; code edits) → MTP (built into DeepSeek/Qwen3.5+/Gemma 4)
+  → DFlash (Z-Lab 2026, block-diffusion drafter, whole block in one pass) → DSpark.
+- vLLM AMD benchmarks (Aug 2026): DFlash up to 2.87×, Gemma4 MTP 2.74×, EAGLE-3 ~2.2× (but <1× on Qwen3-8B MATH500).
+
+### 5.3 Caching
+- Prefix caching: reuse KV across requests, stops at the FIRST different token → stable stuff first, variable stuff last.
+- KV storage G1 VRAM → G2 CPU RAM → G3 SSD → G4 network; loading 10K tokens from RAM ~10 ms vs re-prefill ~1–2 s.
+- Cache-aware routing (send user back to the replica with their cache, balance load); global KV cache on G4.
+- Long context: 27B at 128K = 8 GB KV per user. FlashAttention, PagedAttention, chunked prefill.
+
+### 5.3 LAB: my_prefix_cache.py (Qwen3-0.6B, 2,761-token system prompt + 9-token question, 4060)
+| test | TTFT |
+|---|---|
+| A no cache | ~220 ms |
+| build cache (once) | ~221 ms |
+| B with prefix cache | ~23 ms (9.5×), same first token ' Please' ✅ lossless |
+- 23 ms = one memory-bound pass over 1.2 GB weights + deepcopy of 309 MB cache (real engines share pages).
+- Timestamp FIRST: only 21 of 2,784 tokens reusable (digits tokenized one by one, breaks at 5 vs 9).
+  Timestamp LAST: 2,782 of 2,784 reusable. One line moved = 9× TTFT.

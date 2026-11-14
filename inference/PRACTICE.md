@@ -24,7 +24,7 @@ Model: Qwen3-0.6B (bf16) on RTX 4060 laptop, unless noted.
 - [ ] **P8. Paged cache.** Pages of 16 tokens + a page table (list of page numbers). Same answer as before.
 
 ## Level 4 — inference tricks
-- [ ] **P9. Prefix caching.** Two prompts share a long system prompt. Prefill it once, reuse the cache
+- [x] **P9. Prefix caching.** (done 2026-11-14: my_prefix_cache.py, 220 → 23 ms) Two prompts share a long system prompt. Prefill it once, reuse the cache
       for both. Measure TTFT saved.
 - [ ] **P10. KV quantization.** Store K/V in int8 (scale + round). Measure the error and the memory saved.
 
